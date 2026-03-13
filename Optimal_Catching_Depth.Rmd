@@ -1,0 +1,237 @@
+---
+title: "Optimal Catching Depth"
+author: "Evan Metzger"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document: default
+---
+
+```{r}
+# ================================================================
+# CATCHER FRAMING DEPTH ANALYSIS
+# ================================================================
+
+library(tidyverse)
+library(ggplot2)
+
+# ================================================================
+# STEP 1: LOAD DATA AND FILTER NON-SWINGS
+# ================================================================
+
+# --- Load Data ---
+catch_depth <- read.csv("pitches_catcher_depth.csv")
+
+# --- Basic Counts (optional sanity checks) ---
+length(unique(catch_depth$catcher_id))
+unique(catch_depth$is_interference)
+
+# --- Filter for Non-Swings ---
+non_swings <- catch_depth %>%
+  filter(is_swing == "FALSE")
+
+# ================================================================
+# STEP 2: COMPUTE FRAMING SCORE (non-swings only)
+# ================================================================
+
+weighted_scores <- non_swings %>%
+  filter(!is.na(c_y), !is.na(is_strike), !is.na(expected_strike)) %>%
+  mutate(
+    expected_strike = pmin(pmax(expected_strike, 0), 1),
+    framing_score = case_when(
+      is_strike == TRUE  ~ (1 - expected_strike),
+      is_strike == FALSE ~ -expected_strike,
+      TRUE ~ 0
+    )
+  ) %>%
+  filter(c_y >= -7, c_y <= -3)
+
+# ================================================================
+# STEP 3: FIND EACH CATCHER'S OPTIMAL DEPTH  (trim -> bin -> count)
+# ================================================================
+
+# --- 5th–95th percentile range per catcher (before binning) ---
+catcher_ranges <- weighted_scores %>%
+  group_by(catcher_id) %>%
+  summarise(
+    p05           = quantile(c_y, 0.05, na.rm = TRUE),
+    p95           = quantile(c_y, 0.95, na.rm = TRUE),
+    total_pitches = n(),
+    .groups       = "drop"
+  ) %>%
+  filter(total_pitches >= 15)
+
+# --- Trim each catcher to their own 5–95% range (BEFORE binning) ---
+weighted_scores_trim <- weighted_scores %>%
+  inner_join(catcher_ranges, by = "catcher_id") %>%         # bring in p05/p95
+  filter(c_y >= p05, c_y <= p95) %>%                        # per-catcher trim
+  select(-p05, -p95, -total_pitches)                        # clean up
+
+# --- Bin with ROUND (to match John Doe) ---
+bin_width <- 0.1
+weighted_scores_trim <- weighted_scores_trim %>%
+  mutate(depth_bin = round(c_y / bin_width) * bin_width)
+
+# --- Mean score per catcher & depth bin, require ≥15 AFTER trim ---
+catcher_depth_scores <- weighted_scores_trim %>%
+  group_by(catcher_id, depth_bin) %>%
+  summarise(
+    mean_score = mean(framing_score, na.rm = TRUE),
+    n_pitches  = n(),
+    .groups    = "drop"
+  ) %>%
+  filter(n_pitches >= 15)
+
+# --- Each catcher’s optimal bin (deterministic tie-break) ---
+catcher_optimal_depths <- catcher_depth_scores %>%
+  arrange(catcher_id, desc(mean_score), desc(n_pitches), depth_bin) %>%
+  group_by(catcher_id) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(catcher_id, optimal_depth = depth_bin, mean_score, n_pitches) %>%
+  # optionally reattach total_pitches for later plots/tables:
+  left_join(
+    weighted_scores %>% group_by(catcher_id) %>% summarise(total_pitches = n(), .groups = "drop"),
+    by = "catcher_id"
+  ) %>%
+  arrange(optimal_depth)
+# ================================================================
+# STEP 4: TOP-10 CATCHERS PLOT — AVERAGE VS OPTIMAL DEPTH
+# ================================================================
+
+# --- Average depth per catcher (on TRIMMED sample) ---
+catcher_avg_depth <- weighted_scores_trim %>%
+  group_by(catcher_id) %>%
+  summarise(
+    avg_depth = mean(c_y, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+# If you want total pitch count for ranking by workload, take it from PRE-trim:
+catcher_totals <- weighted_scores %>%
+  group_by(catcher_id) %>%
+  summarise(total_pitches = n(), .groups = "drop")
+
+# --- Score at each catcher's average depth (closest rounded bin) ---
+catcher_avg_scores <- catcher_depth_scores %>%        
+  right_join(catcher_avg_depth, by = "catcher_id") %>%
+  group_by(catcher_id) %>%
+  slice_min(abs(depth_bin - avg_depth), n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(catcher_id, avg_depth = depth_bin, avg_score = mean_score)
+
+# --- Combine average & optimal depth data ---
+catcher_compare <- catcher_avg_scores %>%
+  left_join(
+    catcher_optimal_depths %>%                        
+      select(catcher_id, optimal_depth, optimal_score = mean_score),
+    by = "catcher_id"
+  ) %>%
+  left_join(catcher_totals, by = "catcher_id")         
+
+# --- Plot top 10 catchers (by total pitches) ---
+top10_catchers <- catcher_compare %>%
+  arrange(desc(total_pitches)) %>%
+  distinct(catcher_id, .keep_all = TRUE) %>%
+  slice_head(n = 10)
+
+ggplot(top10_catchers, aes(x = avg_depth, y = avg_score, group = catcher_id)) +
+  geom_segment(aes(xend = optimal_depth, yend = optimal_score),
+               color = "gray70", linewidth = 1) +
+  geom_point(aes(color = "Average Depth"), size = 4) +
+  geom_point(aes(x = optimal_depth, y = optimal_score, color = "Optimal Depth"),
+             size = 4, shape = 17) +
+  scale_color_manual(values = c("Average Depth" = "gray40", "Optimal Depth" = "steelblue")) +
+  labs(
+    title = "Top 10 Catchers: Framing Score at Average vs Optimal Depth",
+    subtitle = "Each line connects a catcher's average setup and their optimal framing depth",
+    x = "Catcher Depth (c_y)",
+    y = "Framing Score",
+    color = "Depth Type"
+  ) +
+  theme_minimal(base_size = 14)
+
+# ================================================================
+# STEP 5: POPULATION-WIDE OPTIMAL DEPTH
+# ================================================================
+
+pop_depth_scores <- weighted_scores %>%                 
+  mutate(depth_bin = round(c_y / 0.1) * 0.1) %>%    
+  group_by(depth_bin) %>%
+  summarise(mean_score = mean(framing_score, na.rm = TRUE), .groups = "drop")
+
+smoothed <- loess(mean_score ~ depth_bin, data = pop_depth_scores, span = 0.4)
+pop_depth_scores$smoothed_score <- predict(smoothed)
+
+optimal_depth <- pop_depth_scores$depth_bin[which.max(pop_depth_scores$smoothed_score)]
+cat("Population Optimal Catcher Depth:", round(optimal_depth, 2), "\n")
+
+ggplot(pop_depth_scores, aes(x = depth_bin, y = smoothed_score)) +
+  geom_line(color = "blue", linewidth = 1.2) +
+  geom_vline(xintercept = optimal_depth, color = "red", linetype = "dashed") +
+  geom_hline(yintercept = 0, color = "black", linetype = "dotted") +
+  coord_cartesian(xlim = c(-7, -3)) +
+  labs(
+    title = "Framing Score by Catcher Depth (Population)",
+    subtitle = paste("Population Optimal Depth:", round(optimal_depth, 2)),
+    x = "Catcher Depth (c_y)",
+    y = "Smoothed Framing Score"
+  ) +
+  theme_minimal(base_size = 14)
+
+# ================================================================
+# STEP 6: BAR GRAPH — DECLINE FROM -3.7 TOWARD 0
+# ================================================================
+
+plot_data <- pop_depth_scores %>%
+  filter(depth_bin >= -3.7 & depth_bin <= 0)
+
+ggplot(plot_data, aes(x = depth_bin, y = smoothed_score)) +
+  geom_col(fill = "steelblue", color = "black", width = 0.08) +
+  geom_vline(xintercept = -3.7, color = "red", linetype = "dashed", linewidth = 1) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dotted") +
+  geom_text(
+    aes(label = round(depth_bin, 1), y = -0.005),
+    vjust = 1, size = 3.5, color = "black"
+  ) +
+  labs(
+    title = "Framing Score Decline by Catcher Depth past -3.7",
+    x = "Catcher Depth (c_y)",
+    y = "Framing Score"
+  ) +
+  theme_minimal(base_size = 14) +
+  coord_cartesian(ylim = c(-0.01, max(plot_data$smoothed_score, na.rm = TRUE) * 1.1)) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+# ================================================================
+# STEP 7: FINAL TABLE 
+# ================================================================
+
+catcher_pitch_counts <- non_swings %>%
+  group_by(catcher_id) %>%
+  summarise(pitch_count = n(), .groups = "drop")
+
+final_catcher_depths <- catch_depth %>%
+  distinct(catcher_id) %>%
+  left_join(catcher_optimal_depths %>% select(catcher_id, optimal_depth), by = "catcher_id") %>%
+  left_join(catcher_pitch_counts, by = "catcher_id") %>%
+  mutate(
+    optimal_depth = ifelse(is.na(optimal_depth), -3.7, optimal_depth),
+    pitch_count   = ifelse(is.na(pitch_count), 0, pitch_count)
+  ) %>%
+  select(catcher_id, optimal_depth, pitch_count) %>%
+  arrange(desc(pitch_count))
+
+print(final_catcher_depths)
+
+```
+
+
+
+
+
+

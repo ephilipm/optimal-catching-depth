@@ -1,0 +1,222 @@
+---
+title: "John Doe Catching Depth"
+author: "Evan Metzger"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document:
+    df_print: paged
+---
+```{r}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(ggplot2)
+
+# ================================================================
+# STEP 1: LOAD DATA AND FILTER NON-SWINGS
+# ================================================================
+
+catch_depth <- read.csv("pitches_catcher_depth.csv")
+
+john_doe <- catch_depth %>%
+filter(catcher_id == "m72dabd74cb0ba7d")
+
+john_doe_non_swing <- john_doe %>%
+filter(is_swing == "FALSE")
+
+# ================================================================
+# STEP 2: COMPUTE JOHN DOE'S FRAMING SCORE AND OPTIMAL DEPTH
+# ================================================================
+
+john_doe_scores <- john_doe_non_swing %>%
+filter(!is.na(c_y), !is.na(is_strike), !is.na(expected_strike)) %>%
+mutate(
+expected_strike = pmin(pmax(expected_strike, 0), 1),
+framing_score = case_when(
+is_strike == TRUE  ~ (1 - expected_strike),
+is_strike == FALSE ~ -expected_strike,
+TRUE ~ 0
+)
+) %>%
+filter(c_y >= -7, c_y <= -3)
+
+depth_p05 <- quantile(john_doe_scores$c_y, 0.05, na.rm = TRUE)
+depth_p95 <- quantile(john_doe_scores$c_y, 0.95, na.rm = TRUE)
+
+john_doe_scores <- john_doe_scores %>%
+filter(c_y >= depth_p05, c_y <= depth_p95)
+
+bin_width <- 0.1
+john_doe_scores <- john_doe_scores %>%
+mutate(depth_bin = round(c_y / bin_width) * bin_width)
+
+john_doe_depth_scores <- john_doe_scores %>%
+group_by(depth_bin) %>%
+summarise(
+mean_score = mean(framing_score, na.rm = TRUE),
+n_pitches = n(),
+.groups = "drop"
+) %>%
+filter(n_pitches >= 15)
+
+john_doe_optimal <- john_doe_depth_scores %>%
+slice_max(mean_score, with_ties = FALSE)
+
+john_doe_avg_depth <- mean(john_doe_scores$c_y, na.rm = TRUE)
+
+print(paste("John Doe's Optimal Catching Depth (c_y):", round(john_doe_optimal$depth_bin, 2)))
+print(paste("John Doe's Average Catching Depth (c_y):", round(john_doe_avg_depth, 2)))
+
+# ================================================================
+# STEP 3: VISUALIZE — FRAMING SCORE BY DEPTH
+# ================================================================
+
+ggplot(john_doe_depth_scores, aes(x = depth_bin, y = mean_score)) +
+geom_col(fill = "steelblue", color = "black", width = 0.08) +
+geom_vline(xintercept = john_doe_optimal$depth_bin, color = "red", linetype = "dashed", linewidth = 1) +
+geom_vline(xintercept = john_doe_avg_depth, color = "blue", linetype = "dashed", linewidth = 1) +
+annotate("text",
+x = john_doe_optimal$depth_bin,
+y = max(john_doe_depth_scores$mean_score, na.rm = TRUE) * 1.05,
+label = paste0("Optimal: ", round(john_doe_optimal$depth_bin, 2), " ft"),
+color = "red", hjust = -0.1, vjust = 0) +
+annotate("text",
+x = john_doe_avg_depth,
+y = max(john_doe_depth_scores$mean_score, na.rm = TRUE) * 1.05,
+label = paste0("Average: ", round(john_doe_avg_depth, 2), " ft"),
+color = "blue", hjust = -0.1, vjust = 0) +
+geom_hline(yintercept = 0, color = "black", linetype = "dotted") +
+labs(
+title = "John Doe: Framing Score by Catcher Depth",
+subtitle = "Red = Optimal Depth | Blue = Average Depth",
+x = "Catcher Depth (c_y)",
+y = "Framing Score"
+) +
+theme_minimal(base_size = 14) +
+ylim(0, max(john_doe_depth_scores$mean_score, na.rm = TRUE) * 1.15)
+
+# ================================================================
+# STEP 4: TABLE — NUMBER OF PITCHES PER DEPTH BIN
+# ================================================================
+
+john_doe_bin_table <- john_doe_depth_scores %>%
+arrange(desc(mean_score)) %>%
+select(depth_bin, n_pitches, mean_score)
+
+print(john_doe_bin_table)
+
+# ================================================================
+# STEP 5: STRIKE RATE BY DEPTH (NON-SWINGS ONLY)
+# ================================================================
+
+john_doe_strike_rate <- john_doe_non_swing %>%
+filter(!is.na(c_y), !is.na(is_strike)) %>%
+filter(c_y >= depth_p05, c_y <= depth_p95) %>%
+mutate(
+depth_bin = floor(c_y / 0.1) * 0.1,
+is_strike = as.logical(is_strike)
+) %>%
+group_by(depth_bin) %>%
+summarise(
+n_pitches   = n(),
+strike_rate = mean(is_strike, na.rm = TRUE),
+.groups = "drop"
+) %>%
+filter(n_pitches >= 15)
+
+avg_strike_rate <- weighted.mean(john_doe_strike_rate$strike_rate,
+john_doe_strike_rate$n_pitches,
+na.rm = TRUE)
+
+print(john_doe_strike_rate)
+
+ggplot(john_doe_strike_rate, aes(x = depth_bin, y = strike_rate)) +
+geom_col(fill = "darkorange", color = "black", width = 0.08) +
+geom_hline(yintercept = avg_strike_rate, color = "black", linetype = "dashed") +
+annotate("text",
+x = min(john_doe_strike_rate$depth_bin),
+y = avg_strike_rate + 0.01,
+label = paste0("Avg Strike Rate = ", scales::percent(avg_strike_rate, accuracy = 0.1)),
+hjust = 0, color = "black", size = 4.5) +
+geom_vline(xintercept = john_doe_optimal$depth_bin, color = "red", linetype = "dashed", linewidth = 1) +
+geom_vline(xintercept = john_doe_avg_depth, color = "blue", linetype = "dashed", linewidth = 1) +
+annotate("text",
+x = john_doe_optimal$depth_bin,
+y = max(john_doe_strike_rate$strike_rate, na.rm = TRUE) * 1.05,
+label = paste0("Optimal: ", round(john_doe_optimal$depth_bin, 2), " ft"),
+color = "red", hjust = -0.1, vjust = 0) +
+annotate("text",
+x = john_doe_avg_depth,
+y = max(john_doe_strike_rate$strike_rate, na.rm = TRUE) * 1.05,
+label = paste0("Average: ", round(john_doe_avg_depth, 2), " ft"),
+color = "blue", hjust = -0.1, vjust = 0) +
+labs(
+title = "John Doe: Strike Rate by Catcher Depth",
+subtitle = "Percent of non-swing pitches called strikes at each depth",
+x = "Catcher Depth (c_y)",
+y = "Strike Rate"
+) +
+scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+theme_minimal(base_size = 14) +
+ylim(0, max(john_doe_strike_rate$strike_rate, na.rm = TRUE) * 1.15)
+
+# ================================================================
+# STEP 6: STRIKE RATE VS EXPECTED STRIKE RATE
+# ================================================================
+
+john_doe_strike_compare <- john_doe_non_swing %>%
+  filter(!is.na(c_y), !is.na(is_strike), !is.na(expected_strike)) %>%
+  filter(c_y >= depth_p05, c_y <= depth_p95) %>%
+  mutate(
+    depth_bin = floor(c_y / 0.1) * 0.1,
+    is_strike = as.logical(is_strike)
+  ) %>%
+  group_by(depth_bin) %>%
+  summarise(
+    n_pitches = n(),
+    actual_strike_rate = mean(is_strike, na.rm = TRUE),
+    expected_strike_rate = mean(expected_strike, na.rm = TRUE),
+    diff = actual_strike_rate - expected_strike_rate,
+    .groups = "drop"
+  ) %>%
+  filter(n_pitches >= 15)
+
+# --- Plot actual vs expected strike rates ---
+ggplot(john_doe_strike_compare, aes(x = depth_bin)) +
+  geom_line(aes(y = expected_strike_rate, color = "Expected"), linewidth = 1.1, linetype = "dashed") +
+  geom_line(aes(y = actual_strike_rate, color = "Actual"), linewidth = 1.2) +
+  geom_vline(xintercept = john_doe_optimal$depth_bin, color = "red", linetype = "dashed", linewidth = 1) +
+  geom_vline(xintercept = john_doe_avg_depth, color = "blue", linetype = "dashed", linewidth = 1) +
+  labs(
+    title = "John Doe: Actual vs Expected Strike Rate by Catcher Depth",
+    subtitle = "Dashed line = Expected | Solid line = Actual | Red = Optimal | Blue = Average",
+    x = "Catcher Depth (c_y)",
+    y = "Strike Rate",
+    color = "Rate Type"
+  ) +
+  scale_color_manual(values = c("Actual" = "darkorange", "Expected" = "gray40")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  theme_minimal(base_size = 14)
+
+john_doe_strike_diff_table <- john_doe_strike_compare %>%
+  select(
+    depth_bin,
+    actual_strike_rate,
+    expected_strike_rate,
+    diff
+  ) %>%
+  arrange(desc(diff)) 
+
+print(
+  john_doe_strike_diff_table %>%
+    mutate(
+      actual_strike_rate = scales::percent(actual_strike_rate, accuracy = 0.1),
+      expected_strike_rate = scales::percent(expected_strike_rate, accuracy = 0.1),
+      diff = scales::percent(diff, accuracy = 0.1)
+    ),
+  n = Inf
+)
+```
+
+
+
